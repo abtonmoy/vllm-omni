@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for DistributedAutoencoderKLLTX2Video encode parallel (CPU-only)."""
+"""Tests for DistributedAutoencoderKLLTX2Video encode parallel (CPU-only).
 
+Unit tests for the tile split/exec/merge ops against a mock encoder, plus two-process
+Gloo integration tests that run LTX2VaeExecutor.execute() end to end -- over a tiny
+real VAE and over the metadata-gather fallback -- checking numerical parity with the
+sequential encode on every rank."""
+
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -333,3 +339,305 @@ class TestEncodeTileMerge:
 
         assert distributed_enc.shape == reference_enc.shape
         torch.testing.assert_close(distributed_enc, reference_enc)
+
+
+# =============================================================================
+# Two-process Gloo integration test (CPU)
+#
+# The unit tests above call encode_tile_split / encode_tile_exec / encode_tile_merge
+# directly, so they never exercise LTX2VaeExecutor.execute() itself: the workload
+# balancing, the all_gather of packed tiles, the rank-0 unpack/merge, and the final
+# broadcast. The tests below spawn a real two-rank Gloo process group and drive the
+# executor end to end, reporting max/mean absolute difference against the sequential
+# encode:
+#
+#   - test_distributed_tiled_encode_matches_sequential_gloo compares the distributed
+#     tiled_encode against diffusers' sequential tiled_encode on a tiny (but real)
+#     AutoencoderKLLTX2Video, over the known-metadata gather path.
+#   - test_distributed_tiled_encode_metadata_fallback_gloo drives the same executor
+#     with the mock encoder above to cover the dynamic metadata-gather fallback,
+#     which a real encoder cannot reach (see that test's docstring).
+#
+# Collectives and tensors are CPU/gloo and the VAE is randomly initialized, so there
+# is no checkpoint download and no GPU work (~24k params). Each case still spawns two
+# fresh processes that re-import torch, so it costs tens of seconds despite the tiny
+# model. Like the other CPU collective tests these go through
+# init_distributed_environment, which picks a device index, so they need at least one
+# visible accelerator -- the same requirement as tests/diffusion/distributed/test_comm.py.
+# =============================================================================
+
+_GLOO_WORLD_SIZE = 2
+_GLOO_FRAMES = 5
+# The executor only pads, gathers and slices tiles; no arithmetic is applied to the
+# encoder outputs, so distributed and sequential tiled_encode must agree bit-exactly
+# in float32. Any nonzero difference means tiles were misplaced, cropped or blended
+# differently, so the tolerance is deliberately 0.
+_GLOO_TOLERANCE = 0.0
+
+
+def _tiny_distributed_ltx2_vae(dtype):
+    """Small but real DistributedAutoencoderKLLTX2Video with random weights.
+
+    ``spatial_compression_ratio`` is 8 (patch_size 2 x two spatiotemporal
+    downsamples) and ``temporal_compression_ratio`` is 4. tile_sample_min 16 /
+    stride 8 against a 24x24 input yields a 3x3 tile grid, so both ranks receive
+    work and the gather/merge path is meaningful. All tile extents (16 and the
+    cropped edge 8) are multiples of the compression ratio, which the real encoder
+    requires -- its space-to-depth downsamplers reject ragged tiles outright, so
+    the metadata-gather fallback is only reachable with the mock encoder above.
+    """
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+        DistributedAutoencoderKLLTX2Video,
+    )
+
+    torch.manual_seed(0)
+    vae = DistributedAutoencoderKLLTX2Video(
+        in_channels=3,
+        out_channels=3,
+        latent_channels=4,
+        block_out_channels=(8, 8),
+        down_block_types=("LTX2VideoDownBlock3D", "LTX2VideoDownBlock3D"),
+        decoder_block_out_channels=(8,),
+        layers_per_block=(1, 1, 1),
+        decoder_layers_per_block=(1, 1),
+        spatio_temporal_scaling=(True, True),
+        decoder_spatio_temporal_scaling=(True,),
+        decoder_inject_noise=(False, False),
+        downsample_type=("spatiotemporal", "spatiotemporal"),
+        upsample_type=("spatiotemporal",),
+        upsample_residual=(True,),
+        upsample_factor=(2,),
+        patch_size=2,
+        patch_size_t=1,
+    )
+    vae.eval().to(dtype=dtype)
+    vae.enable_tiling(
+        tile_sample_min_height=16,
+        tile_sample_min_width=16,
+        tile_sample_stride_height=8,
+        tile_sample_stride_width=8,
+    )
+    return vae
+
+
+def _init_gloo(rank: int, master_port: str) -> None:
+    """Bring up a CPU/gloo world group the way the other CPU collective tests do.
+
+    See tests/diffusion/distributed/test_comm.py. Only the world group is created:
+    the VAE executor binds to it and needs no model-parallel groups.
+    """
+    from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment
+
+    os.environ.update(
+        {
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": str(_GLOO_WORLD_SIZE),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": master_port,
+        }
+    )
+    init_distributed_environment(backend="gloo")
+
+
+def _gloo_encode_worker(rank: int, height: int, width: int, return_dict, master_port: str) -> None:
+    from diffusers.models.autoencoders import AutoencoderKLLTX2Video
+
+    from vllm_omni.diffusion.distributed.parallel_state import destroy_distributed_env
+
+    dtype = torch.float32
+    _init_gloo(rank, master_port)
+
+    try:
+        # The executor binds to the world group at construction, so build the VAE
+        # only after the process group exists.
+        vae = _tiny_distributed_ltx2_vae(dtype)
+        vae.init_distributed()
+
+        torch.manual_seed(1)
+        x = torch.randn(1, 3, _GLOO_FRAMES, height, width, dtype=dtype)
+
+        # Report the tile layout so the grid each case claims to cover is verified
+        # rather than assumed (splitting only slices the input; it runs no encoder).
+        tiletask_list, grid_spec = vae.encode_tile_split(x)
+
+        with torch.inference_mode():
+            # Ground truth: the sequential tiled encode from diffusers, computed
+            # identically on every rank.
+            reference = AutoencoderKLLTX2Video.tiled_encode(vae, x).float()
+
+            # Distributed: routed through LTX2VaeExecutor.execute() over the real
+            # Gloo group.
+            vae.set_parallel_size(_GLOO_WORLD_SIZE, mode="tile")
+            assert vae.is_distributed_enabled(), "distributed tiled encode was not enabled"
+            distributed = vae.tiled_encode(x).float()
+
+        # tiled_encode uses broadcast_result=True because every rank's denoiser
+        # consumes the latents, so each rank must hold the full merged result -- not
+        # just rank 0.
+        diff = (distributed - reference).abs()
+        return_dict[f"rank{rank}"] = {
+            "max_abs_diff": diff.max().item(),
+            "mean_abs_diff": diff.mean().item(),
+            "shape": tuple(distributed.shape),
+            "reference_shape": tuple(reference.shape),
+            "grid_shape": grid_spec.grid_shape,
+            "num_tiles": len(tiletask_list),
+            "metadata_known": "tile_output_shapes" in grid_spec.tile_spec,
+        }
+    finally:
+        destroy_distributed_env()
+
+
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "height,width,master_port,expected_grid",
+    [
+        pytest.param(24, 24, "29613", (3, 3), id="grid3x3"),
+        # One tile and two ranks: the balancer leaves rank 1 with no work, so it
+        # contributes an all-zero buffer to the gather and still has to come out of
+        # the broadcast holding the full latent.
+        pytest.param(8, 8, "29614", (1, 1), id="grid1x1_idle_rank"),
+    ],
+)
+def test_distributed_tiled_encode_matches_sequential_gloo(
+    height: int, width: int, master_port: str, expected_grid: tuple[int, int]
+):
+    import torch.multiprocessing as mp
+
+    manager = mp.get_context("spawn").Manager()
+    return_dict = manager.dict()
+
+    mp.spawn(
+        _gloo_encode_worker,
+        args=(height, width, return_dict, master_port),
+        nprocs=_GLOO_WORLD_SIZE,
+        join=True,
+    )
+
+    assert len(return_dict) == _GLOO_WORLD_SIZE, (
+        f"expected {_GLOO_WORLD_SIZE} rank results, got {sorted(return_dict.keys())}"
+    )
+    for rank in range(_GLOO_WORLD_SIZE):
+        res = return_dict[f"rank{rank}"]
+        print(
+            f"rank{rank} distributed vs sequential tiled_encode "
+            f"({height}x{width}, {_GLOO_FRAMES} frames, float32, grid={res['grid_shape']}, "
+            f"tiles={res['num_tiles']}, shape={res['shape']}): "
+            f"max_abs_diff={res['max_abs_diff']:.6e} mean_abs_diff={res['mean_abs_diff']:.6e}"
+        )
+        assert res["grid_shape"] == expected_grid, (
+            f"rank{rank} tiled into {res['grid_shape']}, expected {expected_grid}"
+        )
+        # Every tile extent here divides spatial_compression_ratio, so this exercises
+        # the known-metadata gather; the fallback is covered by the test below.
+        assert res["metadata_known"], f"rank{rank} unexpectedly took the metadata-gather fallback"
+        assert res["shape"] == res["reference_shape"], (
+            f"rank{rank} distributed shape {res['shape']} != sequential {res['reference_shape']}"
+        )
+        assert res["max_abs_diff"] <= _GLOO_TOLERANCE, (
+            f"rank{rank} max_abs_diff {res['max_abs_diff']:.6e} exceeds {_GLOO_TOLERANCE:.6e}"
+        )
+        assert res["mean_abs_diff"] <= _GLOO_TOLERANCE, (
+            f"rank{rank} mean_abs_diff {res['mean_abs_diff']:.6e} exceeds {_GLOO_TOLERANCE:.6e}"
+        )
+
+
+def _gloo_fallback_worker(rank: int, height: int, width: int, return_dict, master_port: str) -> None:
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+        DistributedAutoencoderKLLTX2Video,
+        LTX2VaeExecutor,
+    )
+    from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
+        DistributedOperator,
+    )
+    from vllm_omni.diffusion.distributed.parallel_state import destroy_distributed_env
+
+    _init_gloo(rank, master_port)
+
+    try:
+        executor = LTX2VaeExecutor()
+        executor.set_parallel_size(_GLOO_WORLD_SIZE, mode="tile")
+
+        # Separate mock instances so the reference and the distributed run cannot
+        # share blend state; the mock encoder is a pure function of its input.
+        reference_vae = _DummyLTX2Vae()
+        vae = _DummyLTX2Vae()
+
+        torch.manual_seed(2)
+        x = torch.randn(1, 3, 5, height, width)
+
+        _, probe_spec = DistributedAutoencoderKLLTX2Video.encode_tile_split(vae, x)
+        metadata_known = "tile_output_shapes" in probe_spec.tile_spec
+
+        reference = _reference_tiled_encode(reference_vae, x)
+        distributed = executor.execute(
+            x,
+            DistributedOperator(
+                split=lambda z: DistributedAutoencoderKLLTX2Video.encode_tile_split(vae, z),
+                exec=lambda task: DistributedAutoencoderKLLTX2Video.encode_tile_exec(vae, task),
+                merge=lambda coord_map, spec: DistributedAutoencoderKLLTX2Video.encode_tile_merge(vae, coord_map, spec),
+            ),
+            broadcast_result=True,
+        )
+
+        diff = (distributed - reference).abs()
+        return_dict[f"rank{rank}"] = {
+            "max_abs_diff": diff.max().item(),
+            "mean_abs_diff": diff.mean().item(),
+            "shape": tuple(distributed.shape),
+            "reference_shape": tuple(reference.shape),
+            "metadata_known": metadata_known,
+        }
+    finally:
+        destroy_distributed_env()
+
+
+@pytest.mark.diffusion
+@pytest.mark.parallel
+def test_distributed_tiled_encode_metadata_fallback_gloo():
+    """The metadata-gather fallback, driven through real collectives.
+
+    A real LTX-2 encoder rejects tiles whose extents do not divide
+    spatial_compression_ratio, so the fallback cannot be reached with a real VAE.
+    Driving LTX2VaeExecutor.execute() with the mock encoder instead covers the
+    branch the fast-path test above skips: the shape all-reduce, the packed
+    per-tile metadata tensor, the second gather, and the dynamic unpack.
+    """
+    import torch.multiprocessing as mp
+
+    manager = mp.get_context("spawn").Manager()
+    return_dict = manager.dict()
+
+    # 28x26 with stride 12 leaves edge tiles of width 2, which does not divide the
+    # mock spatial_compression_ratio of 4, so the predicted shapes are dropped.
+    mp.spawn(
+        _gloo_fallback_worker,
+        args=(28, 26, return_dict, "29615"),
+        nprocs=_GLOO_WORLD_SIZE,
+        join=True,
+    )
+
+    assert len(return_dict) == _GLOO_WORLD_SIZE, (
+        f"expected {_GLOO_WORLD_SIZE} rank results, got {sorted(return_dict.keys())}"
+    )
+    for rank in range(_GLOO_WORLD_SIZE):
+        res = return_dict[f"rank{rank}"]
+        print(
+            f"rank{rank} metadata-gather fallback vs sequential tiled_encode "
+            f"(28x26, float32, shape={res['shape']}): "
+            f"max_abs_diff={res['max_abs_diff']:.6e} mean_abs_diff={res['mean_abs_diff']:.6e}"
+        )
+        assert not res["metadata_known"], (
+            f"rank{rank} kept the predicted shapes, so this case did not reach the fallback"
+        )
+        assert res["shape"] == res["reference_shape"], (
+            f"rank{rank} distributed shape {res['shape']} != sequential {res['reference_shape']}"
+        )
+        assert res["max_abs_diff"] <= _GLOO_TOLERANCE, (
+            f"rank{rank} max_abs_diff {res['max_abs_diff']:.6e} exceeds {_GLOO_TOLERANCE:.6e}"
+        )
+        assert res["mean_abs_diff"] <= _GLOO_TOLERANCE, (
+            f"rank{rank} mean_abs_diff {res['mean_abs_diff']:.6e} exceeds {_GLOO_TOLERANCE:.6e}"
+        )
