@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -95,7 +95,7 @@ class DistributedAutoencoderKLLTX2Video(AutoencoderKLLTX2Video, DistributedVaeMi
         sample_num_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
         output_channels = int(getattr(getattr(self, "config", None), "out_channels", 3))
 
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         tile_output_shapes = {}
         for i in range(0, height, tile_latent_stride_height):
             for j in range(0, width, tile_latent_stride_width):
@@ -215,7 +215,7 @@ class DistributedAutoencoderKLLTX2Video(AutoencoderKLLTX2Video, DistributedVaeMi
         tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
         tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
 
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         tile_output_shapes = {}
         output_shapes_known = True
         for i in range(0, height, self.tile_sample_stride_height):
