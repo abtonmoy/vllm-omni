@@ -39,34 +39,45 @@ class LTX2VaeExecutor(DistributedVaeExecutor):
         return coord_tensor_map
 
     def execute(self, z: torch.Tensor, operator: DistributedOperator, broadcast_result: bool = True):
+        """Known-metadata fast path: skips the shape all-reduce and the metadata gather of the base.
+
+        Every rank-local stage (split, tile execution, packing, root merge) is wrapped in the
+        same error-agreement phases as the base implementation, so a failure on one rank is
+        raised on every rank instead of leaving the peers blocked in the next collective.
+        """
         pp_size = min(self.parallel_size, self.world_size)
 
-        tiletask_list, grid_spec = operator.split(z)
+        with self._sync_errors("tile split"):
+            tiletask_list, grid_spec = operator.split(z)
         max_tile_output_shape = grid_spec.tile_spec.get("max_tile_output_shape")
         tile_output_shapes = grid_spec.tile_spec.get("tile_output_shapes")
         if max_tile_output_shape is None or tile_output_shapes is None:
+            # The split is identical on every rank, so all ranks take the protected base path.
             return super().execute(z, operator, broadcast_result=broadcast_result)
 
-        assigned = self._balance_tasks(tiletask_list, pp_size)
-        local_tasks = assigned[self.rank] if self.rank < pp_size else []
-        local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
+        with self._sync_errors("tile execution"):
+            assigned = self._balance_tasks(tiletask_list, pp_size)
+            local_tasks = assigned[self.rank] if self.rank < pp_size else []
+            local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         output_dtype = grid_spec.output_dtype if grid_spec.output_dtype is not None else z.dtype
         max_local_tile_count = max(len(tasks) for tasks in assigned)
         global_padding_shape = [max_local_tile_count, *max_tile_output_shape]
-        local_tile_tensor = self._pack_local_tiles_without_meta(
-            local_results,
-            global_padding_shape,
-            z.device,
-            output_dtype,
-        )
+        with self._sync_errors("tile packing"):
+            local_tile_tensor = self._pack_local_tiles_without_meta(
+                local_results,
+                global_padding_shape,
+                z.device,
+                output_dtype,
+            )
         tile_gather = self.gather_tensors(local_tile_tensor)
 
-        if self.rank != 0:
-            result = torch.empty(0, device=z.device)
-        else:
-            coord_tensor_map = self._unpack_tiles_with_known_metadata(tile_gather, assigned, tile_output_shapes)
-            result = operator.merge(coord_tensor_map, grid_spec)
+        with self._sync_errors("tile merge"):
+            if self.rank != 0:
+                result = torch.empty(0, device=z.device)
+            else:
+                coord_tensor_map = self._unpack_tiles_with_known_metadata(tile_gather, assigned, tile_output_shapes)
+                result = operator.merge(coord_tensor_map, grid_spec)
 
         if broadcast_result:
             result = self._sync_final_result(result, z.ndim, z.device, output_dtype)

@@ -9,6 +9,7 @@ real VAE and over the metadata-gather fallback -- checking numerical parity with
 sequential encode on every rank."""
 
 import os
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -357,6 +358,9 @@ class TestEncodeTileMerge:
 #   - test_distributed_tiled_encode_metadata_fallback_gloo drives the same executor
 #     with the mock encoder above to cover the dynamic metadata-gather fallback,
 #     which a real encoder cannot reach (see that test's docstring).
+#   - test_distributed_tiled_encode_error_recovery_gloo injects a non-root encode
+#     failure and a root merge failure into the known-metadata fast path and checks
+#     that both ranks raise the agreed error, without hanging, and can encode again.
 #
 # Collectives and tensors are CPU/gloo and the VAE is randomly initialized, so there
 # is no checkpoint download and no GPU work (~24k params). Each case still spawns two
@@ -646,3 +650,85 @@ def test_distributed_tiled_encode_metadata_fallback_gloo():
         assert res["mean_abs_diff"] <= _GLOO_TOLERANCE, (
             f"rank{rank} mean_abs_diff {res['mean_abs_diff']:.6e} exceeds {_GLOO_TOLERANCE:.6e}"
         )
+
+
+def _gloo_error_recovery_worker(rank: int, init_file: str) -> None:
+    """Inject rank-local failures into the known-metadata fast path and check every rank sees them."""
+    import torch.distributed as dist
+    from diffusers.models.autoencoders import AutoencoderKLLTX2Video
+
+    from vllm_omni.diffusion.distributed.autoencoders import distributed_vae_executor as vae_executor
+
+    torch.set_num_threads(1)
+    # A bounded group timeout turns a peer left waiting in a collective into a failure
+    # instead of a hung test run.
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=_GLOO_WORLD_SIZE,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        # Only the world group is needed; bind the executor straight to it, like
+        # tests/diffusion/distributed/test_vae_error_recovery.py does for the base executor.
+        group = SimpleNamespace(device_group=dist.group.WORLD, cpu_group=dist.group.WORLD)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(vae_executor, "get_world_group", lambda: group)
+            vae = _tiny_distributed_ltx2_vae(torch.float32)
+            vae.init_distributed()
+        vae.set_parallel_size(_GLOO_WORLD_SIZE, mode="tile")
+        assert vae.is_distributed_enabled()
+
+        torch.manual_seed(1)
+        x = torch.randn(1, 3, _GLOO_FRAMES, 24, 24)
+        _, grid_spec = vae.encode_tile_split(x)
+        assert "tile_output_shapes" in grid_spec.tile_spec, "expected the known-metadata fast path"
+        with torch.inference_mode():
+            reference = AutoencoderKLLTX2Video.tiled_encode(vae, x)
+
+        def fail_oom(*args, **kwargs):
+            raise torch.OutOfMemoryError("injected encode OOM")
+
+        def fail_merge(*args, **kwargs):
+            raise ValueError("injected merge failure")
+
+        # A non-root encode failure: rank 0 would otherwise block in the tile gather.
+        with pytest.MonkeyPatch.context() as patch:
+            if rank == 1:
+                patch.setattr(vae, "encode_tile_exec", fail_oom)
+            with pytest.raises(torch.OutOfMemoryError, match="Distributed VAE"), torch.inference_mode():
+                vae.tiled_encode(x)
+
+        # A root merge failure: rank 1 would otherwise block in the final-result broadcast.
+        with pytest.MonkeyPatch.context() as patch:
+            if rank == 0:
+                patch.setattr(vae, "encode_tile_merge", fail_merge)
+            with pytest.raises(RuntimeError, match="Distributed VAE"), torch.inference_mode():
+                vae.tiled_encode(x)
+
+        # The group is left in a usable state: the next encode succeeds and is still exact.
+        with torch.inference_mode():
+            recovered = vae.tiled_encode(x)
+        torch.testing.assert_close(recovered, reference, rtol=0.0, atol=0.0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.diffusion
+@pytest.mark.parallel
+def test_distributed_tiled_encode_error_recovery_gloo(tmp_path):
+    """Rank-local failures in the known-metadata fast path are raised on every rank, without hanging.
+
+    Covers the LTX2VaeExecutor override, which tests/diffusion/distributed/test_vae_error_recovery.py
+    does not reach: a non-root encode OOM and a root merge error both surface on both ranks as
+    the agreed exception, and a subsequent encode on the same group succeeds.
+    """
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _gloo_error_recovery_worker,
+        args=(str(tmp_path / "rendezvous"),),
+        nprocs=_GLOO_WORLD_SIZE,
+        join=True,
+    )
