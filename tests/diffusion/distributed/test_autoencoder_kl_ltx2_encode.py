@@ -361,9 +361,9 @@ class TestEncodeTileMerge:
 # Collectives and tensors are CPU/gloo and the VAE is randomly initialized, so there
 # is no checkpoint download and no GPU work (~24k params). Each case still spawns two
 # fresh processes that re-import torch, so it costs tens of seconds despite the tiny
-# model. Like the other CPU collective tests these go through
-# init_distributed_environment, which picks a device index, so they need at least one
-# visible accelerator -- the same requirement as tests/diffusion/distributed/test_comm.py.
+# model. Like the other CPU collective tests (tests/diffusion/distributed/test_comm.py)
+# each worker selects the CPU platform before init_distributed_environment, so the
+# two ranks never resolve to physical GPUs and the file runs on a single-card host.
 # =============================================================================
 
 _GLOO_WORLD_SIZE = 2
@@ -426,6 +426,7 @@ def _init_gloo(rank: int, master_port: str) -> None:
     See tests/diffusion/distributed/test_comm.py. Only the world group is created:
     the VAE executor binds to it and needs no model-parallel groups.
     """
+    from tests.helpers.distributed import configure_cpu_collective_worker
     from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment
 
     os.environ.update(
@@ -437,6 +438,10 @@ def _init_gloo(rank: int, master_port: str) -> None:
             "MASTER_PORT": master_port,
         }
     )
+    # Gloo ranks can outnumber the host's GPUs (CI runs this file on one card), so
+    # route the coordinator through the CPU platform like the other CPU collective
+    # tests; otherwise rank 1 resolves to a physical device that does not exist.
+    configure_cpu_collective_worker()
     init_distributed_environment(backend="gloo")
 
 
